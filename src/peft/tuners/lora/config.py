@@ -70,6 +70,18 @@ class LoftQConfig:
 
 
 @dataclass
+class PiSSAQuantConfig:
+    """
+    This is the sub-configuration class to store the configuration of a [`LoraModel`].
+
+    Args:
+        bits (`int`): Quantization bits for LoftQ.
+    """
+
+    pissaquant_bits: int = field(default=4, metadata={"help": "Quantization bits for PiSSAQuant"})
+
+
+@dataclass
 class EvaConfig:
     """
     This is the sub-configuration class to store the configuration for a data-driven initialization via EVA. EVA was
@@ -349,7 +361,7 @@ class LoraConfig(PeftConfig):
         },
     )
     init_lora_weights: (
-        bool | Literal["gaussian", "eva", "olora", "pissa", "pissa_niter_[number of iters]", "corda", "loftq"]
+        bool | Literal["gaussian", "eva", "olora", "pissa", "pissa_niter_[number of iters]", "corda", "loftq", "PiSSAQuant", "PiSSAQuant_load"]
     ) = field(
         default=True,
         metadata={
@@ -438,6 +450,15 @@ class LoraConfig(PeftConfig):
             "help": (
                 "The configuration of LoftQ. If this is passed, then LoftQ will be used to quantize the backbone "
                 "weights and initialize Lora layers. Also set `init_lora_weights='loftq'` in this case."
+            )
+        },
+    )
+    pissaquant_config: Union[PiSSAQuantConfig, dict] = field(
+        default_factory=dict, 
+        metadata={
+            "help": (
+                "The configuration of PiSSAQuant. If this is passed, then PiSSAQuant will be used to quantize the backbone "
+                "weights and initialize PiSSAQuant layers. Also set `init_lora_weights='pissaquant'` in this case."
             )
         },
     )
