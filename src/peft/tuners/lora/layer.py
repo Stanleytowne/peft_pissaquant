@@ -424,6 +424,7 @@ class LoraLayer(BaseTunerLayer):
         weight = self.get_base_layer().weight
         kwargs = {
             "num_bits": self.kwargs.get("pissaquant_bits", 4),
+            "apply_quantization": self.kwargs.get("apply_quantization", False),
             "reduced_rank": self.r[adapter_name],
         }
 
@@ -1817,6 +1818,7 @@ def dispatch_default(
             )
             kwargs["fan_in_fan_out"] = lora_config.fan_in_fan_out = False
         kwargs.update(lora_config.loftq_config)
+        kwargs.update(lora_config.pissaquant_config)
         new_module = Linear(target, adapter_name, **kwargs)
     elif isinstance(target_base_layer, Conv1D):
         if not kwargs["fan_in_fan_out"]:

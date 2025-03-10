@@ -79,6 +79,7 @@ class PiSSAQuantConfig:
     """
 
     pissaquant_bits: int = field(default=4, metadata={"help": "Quantization bits for PiSSAQuant"})
+    apply_quantization: bool = field(default=False, metadata={"help": "if apply_quantization, there's loss in performance"})
 
 
 @dataclass
