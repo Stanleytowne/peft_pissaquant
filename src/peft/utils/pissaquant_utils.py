@@ -187,13 +187,21 @@ def _low_rank_decomposition(weight, reduced_rank=32):
     return {"U": U, "S": S, "Vh": Vh, "reduced_rank": reduced_rank}
 
 
+def get_hadamard(rank):
+    import math
+    assert rank > 0 and math.log2(rank).is_integer(), 'rank should be a power of 2'
+    def hadamard_matrix(n):
+        if n == 1:
+            return torch.tensor([[1]], dtype=torch.float32)
+        H = hadamard_matrix(n // 2)
+        return torch.cat([torch.cat([H, H], dim=1), torch.cat([H, -H], dim=1)], dim=0)
+
+    H = hadamard_matrix(rank)
+    return H / (rank ** 0.5)
+
+
 @torch.no_grad()
 def pissaquant_init(weight: Union[torch.Tensor, torch.nn.Parameter], num_bits: int, reduced_rank: int, apply_quantization: bool):
-    # if is_bnb_available():
-    #     import bitsandbytes as bnb
-    # else:
-    #     raise ValueError("bitsandbytes is not available, please install it to use PiSSAQuant.")
-
     if num_bits not in [2, 4, 8]:
         raise ValueError("Only support 2, 4, 8 bits quantization")
 
@@ -226,12 +234,14 @@ def pissaquant_init(weight: Union[torch.Tensor, torch.nn.Parameter], num_bits: i
     # Decompose the residual by SVD
     output = _low_rank_decomposition(absmax_expanded, reduced_rank=reduced_rank)
     U, S, Vh = output["U"], output["S"], output["Vh"]
+    C = get_hadamard(reduced_rank).to(device=weight.device)
 
-    lora_A, lora_B, lora_S = Vh, U, S
+    lora_A = C @ torch.sqrt(torch.diag(S)) @ Vh
+    lora_B = U @ torch.sqrt(torch.diag(S)) @ C
 
     if apply_quantization:
         new_weight = quantizer.dequantize_block(quantized_weight, torch.ones_like(max_abs, device=max_abs.device, dtype=max_abs.dtype), shape)
     else:
-        new_weight = weight / (lora_B @ torch.diag(lora_S) @ lora_A)
+        new_weight = weight / (lora_B @ lora_A)
 
-    return new_weight.to(device=device, dtype=dtype), lora_A, lora_B, lora_S
+    return new_weight.to(device=device, dtype=dtype), lora_A, lora_B

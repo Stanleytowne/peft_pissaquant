@@ -58,9 +58,9 @@ class LoraLayer(BaseTunerLayer):
         self._disable_adapters = False
         self.merged_adapters = []
         self.use_dora: dict[str, bool] = {}
+        self.use_pissaquant: dict[str, bool] = {}
         self.lora_bias: dict[str, bool] = {}
         self.lora_magnitude_vector = torch.nn.ModuleDict()  # for DoRA
-        self.lora_S = nn.ParameterDict()            # for pissaquant
         self._caches: dict[str, Any] = {}
         self.ephemeral_gpu_offload: bool = ephemeral_gpu_offload
         # flag to enable/disable casting of input to weight dtype during forward call
@@ -158,8 +158,12 @@ class LoraLayer(BaseTunerLayer):
             with gather_params_ctx(self.get_base_layer().weight):
                 self.corda_init(adapter_name, init_lora_weights)
         elif isinstance(init_lora_weights, str) and init_lora_weights.startswith("PiSSAQuant"):
+            self.use_pissaquant[adapter_name] = True
             with gather_params_ctx(self.get_base_layer().weight):
                 self.pissaquant_init(adapter_name, init_lora_weights)
+            self._move_adapter_to_device_of_base_layer(adapter_name)
+            self.set_adapter(self.active_adapters)
+            return
         elif isinstance(init_lora_weights, str) and init_lora_weights.lower() == "olora":
             with gather_params_ctx(self.get_base_layer().weight):
                 self.olora_init(adapter_name)
@@ -178,6 +182,7 @@ class LoraLayer(BaseTunerLayer):
             self.use_dora[adapter_name] = True
         else:
             self.use_dora[adapter_name] = False
+        self.use_pissaquant[adapter_name] = False
 
         self.set_adapter(self.active_adapters)
 
@@ -407,18 +412,9 @@ class LoraLayer(BaseTunerLayer):
         self.lora_magnitude_vector[adapter_name] = dora_layer
     
     def pissaquant_init(self, adapter_name, init_lora_weights):
-        if not self.lora_S:
-            # first dora layer being added, add lora_S to the list of learnable parameters
-            self.adapter_layer_names = self.adapter_layer_names[:] + ("lora_S",)
-
-        if init_lora_weights != 'PiSSAQuant':
-            self.lora_S[adapter_name] = torch.nn.Parameter(
-                torch.ones(self.r[adapter_name], 
-                dtype=self.lora_A[adapter_name].weight.dtype,
-                device=self.lora_A[adapter_name].weight.device)
-            )
+        if init_lora_weights != "PiSSAQuant":
             return
-
+        
         from peft.utils.pissaquant_utils import pissaquant_init
 
         weight = self.get_base_layer().weight
@@ -428,10 +424,9 @@ class LoraLayer(BaseTunerLayer):
             "reduced_rank": self.r[adapter_name],
         }
 
-        new_weight, lora_A, lora_B, lora_S = pissaquant_init(weight, **kwargs)
+        new_weight, lora_A, lora_B = pissaquant_init(weight, **kwargs)
         self.lora_A[adapter_name].weight.data = lora_A.contiguous()
         self.lora_B[adapter_name].weight.data = lora_B.contiguous()
-        self.lora_S[adapter_name] = nn.Parameter(lora_S.contiguous())
         self.get_base_layer().weight.data = new_weight.contiguous()
 
     def _cache_store(self, key: str, value: Any) -> None:
@@ -603,16 +598,15 @@ class Linear(nn.Module, LoraLayer):
             # no adapter to merge
             return
         
-        if self.active_adapters[0] in self.lora_S.keys():
+        if self.use_pissaquant[self.active_adapters[0]]:
             assert len(self.active_adapters) == 1, "only support one pissaquant adapter at a time"
             base_layer = self.get_base_layer()
             active_adapter = self.active_adapters[0]
             lora_A = self.lora_A[active_adapter].weight.data
             lora_B = self.lora_B[active_adapter].weight.data
-            lora_S = self.lora_S[active_adapter].data
             weight = base_layer.weight.data
 
-            weight_recon = weight * (lora_B @ torch.diag(lora_S) @ lora_A)
+            weight_recon = weight * (lora_B @ lora_A)
             base_layer.weight.data = weight_recon
             self.merged_adapters.append(active_adapter)
             return
@@ -756,15 +750,14 @@ class Linear(nn.Module, LoraLayer):
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         # TODO: 
-        elif self.active_adapters[0] in self.lora_S.keys():
+        elif self.use_pissaquant[self.active_adapters[0]]:
             assert len(self.active_adapters) == 1, "only support one pissaquant adapter at a time"
             active_adapter = self.active_adapters[0]
             lora_A = self.lora_A[active_adapter].weight
             lora_B = self.lora_B[active_adapter].weight
-            lora_S = self.lora_S[active_adapter]
             weight = self.base_layer.weight
 
-            weight_recon = weight * (lora_B @ torch.diag(lora_S) @ lora_A)
+            weight_recon = weight * (lora_B @ lora_A)
             result = F.linear(x, weight_recon, self.base_layer.bias)
 
         else:
