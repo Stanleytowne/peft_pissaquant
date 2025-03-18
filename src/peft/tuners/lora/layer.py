@@ -283,8 +283,12 @@ class LoraLayer(BaseTunerLayer):
                 f"init_lora_weights should be 'pissa' or 'pissa_niter_[number of iters]', got {init_lora_weights} instead."
             )
 
-        lora_A = torch.diag(torch.sqrt(Sr)) @ Uhr
-        lora_B = Vr @ torch.diag(torch.sqrt(Sr))
+        from peft.utils.pissaquant_utils import get_hadamard
+        H = get_hadamard(self.r[adapter_name]).to(device=Vr.device)
+
+        lora_A = H @ torch.diag(torch.sqrt(Sr)) @ Uhr
+        lora_B = Vr @ torch.diag(torch.sqrt(Sr)) @ H
+
         self.lora_A[adapter_name].weight.data = lora_A
         self.lora_B[adapter_name].weight.data = lora_B
         weight = weight.data - self.scaling[adapter_name] * lora_B @ lora_A
