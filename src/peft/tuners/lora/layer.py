@@ -60,7 +60,6 @@ class LoraLayer(BaseTunerLayer):
         self.use_dora: dict[str, bool] = {}
         self.lora_bias: dict[str, bool] = {}
         self.lora_magnitude_vector = torch.nn.ModuleDict()  # for DoRA
-        self.lora_S = nn.ParameterDict()            # for pissaquant
         self._caches: dict[str, Any] = {}
         self.ephemeral_gpu_offload: bool = ephemeral_gpu_offload
         # flag to enable/disable casting of input to weight dtype during forward call
@@ -407,16 +406,8 @@ class LoraLayer(BaseTunerLayer):
         self.lora_magnitude_vector[adapter_name] = dora_layer
     
     def pissaquant_init(self, adapter_name, init_lora_weights):
-        if not self.lora_S:
-            # first dora layer being added, add lora_S to the list of learnable parameters
-            self.adapter_layer_names = self.adapter_layer_names[:] + ("lora_S",)
 
         if init_lora_weights != 'PiSSAQuant':
-            self.lora_S[adapter_name] = torch.nn.Parameter(
-                torch.ones(self.r[adapter_name], 
-                dtype=self.lora_A[adapter_name].weight.dtype,
-                device=self.lora_A[adapter_name].weight.device)
-            )
             return
 
         from peft.utils.pissaquant_utils import pissaquant_init
@@ -428,10 +419,9 @@ class LoraLayer(BaseTunerLayer):
             "reduced_rank": self.r[adapter_name],
         }
 
-        new_weight, lora_A, lora_B, lora_S = pissaquant_init(weight, **kwargs)
+        new_weight, lora_A, lora_B = pissaquant_init(weight, **kwargs)
         self.lora_A[adapter_name].weight.data = lora_A.contiguous()
         self.lora_B[adapter_name].weight.data = lora_B.contiguous()
-        self.lora_S[adapter_name] = nn.Parameter(lora_S.contiguous())
         self.get_base_layer().weight.data = new_weight.contiguous()
 
     def _cache_store(self, key: str, value: Any) -> None:

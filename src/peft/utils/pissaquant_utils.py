@@ -227,11 +227,12 @@ def pissaquant_init(weight: Union[torch.Tensor, torch.nn.Parameter], num_bits: i
     output = _low_rank_decomposition(absmax_expanded, reduced_rank=reduced_rank)
     U, S, Vh = output["U"], output["S"], output["Vh"]
 
-    lora_A, lora_B, lora_S = Vh, U, S
+    lora_B = U @ torch.sqrt(torch.diag(S))
+    lora_A = Vh @ torch.sqrt(torch.diag(S))
 
     if apply_quantization:
         new_weight = quantizer.dequantize_block(quantized_weight, torch.ones_like(max_abs, device=max_abs.device, dtype=max_abs.dtype), shape)
     else:
-        new_weight = weight / (lora_B @ torch.diag(lora_S) @ lora_A)
+        new_weight = weight / (lora_B @ lora_A.T)
 
-    return new_weight.to(device=device, dtype=dtype), lora_A, lora_B, lora_S
+    return new_weight.to(device=device, dtype=dtype), lora_A, lora_B
