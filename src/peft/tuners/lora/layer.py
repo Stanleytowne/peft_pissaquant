@@ -593,16 +593,16 @@ class Linear(nn.Module, LoraLayer):
             # no adapter to merge
             return
         
-        if self.active_adapters[0] in self.lora_S.keys():
+        if self.kwargs.get('pissaquant_bits', None):
+            print("mergin pissaquant module")
             assert len(self.active_adapters) == 1, "only support one pissaquant adapter at a time"
             base_layer = self.get_base_layer()
             active_adapter = self.active_adapters[0]
             lora_A = self.lora_A[active_adapter].weight.data
             lora_B = self.lora_B[active_adapter].weight.data
-            lora_S = self.lora_S[active_adapter].data
             weight = base_layer.weight.data
 
-            weight_recon = weight * (lora_B @ torch.diag(lora_S) @ lora_A)
+            weight_recon = weight * (lora_B @ lora_A).to(weight.dtype)
             base_layer.weight.data = weight_recon
             self.merged_adapters.append(active_adapter)
             return
@@ -746,15 +746,14 @@ class Linear(nn.Module, LoraLayer):
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         # TODO: 
-        elif self.active_adapters[0] in self.lora_S.keys():
+        elif self.kwargs.get('pissaquant_bits', None):
             assert len(self.active_adapters) == 1, "only support one pissaquant adapter at a time"
             active_adapter = self.active_adapters[0]
             lora_A = self.lora_A[active_adapter].weight
             lora_B = self.lora_B[active_adapter].weight
-            lora_S = self.lora_S[active_adapter]
             weight = self.base_layer.weight
 
-            weight_recon = weight * (lora_B @ torch.diag(lora_S) @ lora_A)
+            weight_recon = weight * (lora_B @ lora_A).to(weight.dtype)
             result = F.linear(x, weight_recon, self.base_layer.bias)
 
         else:

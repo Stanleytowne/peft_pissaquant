@@ -205,9 +205,10 @@ def pissaquant_init(weight: Union[torch.Tensor, torch.nn.Parameter], num_bits: i
         f"Weight: ({out_feature}, {in_feature}) | Rank: {reduced_rank} | Num Bits: {num_bits}"
     )
 
-    if in_feature % reduced_rank:
-        raise ValueError("in_feature should be divisible by reduced_rank")
     block_size = in_feature // reduced_rank
+    while in_feature % block_size:
+        block_size -= 1
+    assert block_size > 0
 
     quantizer = NFQuantizer(num_bits=num_bits, device=device, method="normal", block_size=block_size)
     compute_device = device
@@ -228,8 +229,7 @@ def pissaquant_init(weight: Union[torch.Tensor, torch.nn.Parameter], num_bits: i
     U, S, Vh = output["U"], output["S"], output["Vh"]
 
     lora_B = U @ torch.sqrt(torch.diag(S))
-    lora_A = Vh @ torch.sqrt(torch.diag(S))
-
+    lora_A = torch.sqrt(torch.diag(S)) @ Vh
     if apply_quantization:
         new_weight = quantizer.dequantize_block(quantized_weight, torch.ones_like(max_abs, device=max_abs.device, dtype=max_abs.dtype), shape)
     else:
