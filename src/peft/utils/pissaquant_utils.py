@@ -157,12 +157,12 @@ class NFQuantizer:
 
         return qweight
 
-def refine_AB(W, B, A, quantizer, steps=2000, lr=1e-3):
+def refine_AB(W, B, A, quantizer, steps=3000, lr=1e-3):
     """
     W ~ (B @ A) * Q
     """
-    B = B.requires_grad_(True)
-    A = A.requires_grad_(True)    
+    B = B.clone().detach().requires_grad_(True)
+    A = A.clone().detach().requires_grad_(True)    
     
     optimizer = torch.optim.Adam([B, A], lr=lr)
     
