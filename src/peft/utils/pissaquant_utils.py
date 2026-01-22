@@ -30,157 +30,31 @@ from transformers.utils.hub import get_checkpoint_shard_files
 
 from peft.import_utils import is_bnb_4bit_available, is_bnb_available
 
+_normal_map = {}
 
-class NFQuantizer:
-    def __init__(self, num_bits=2, device="cuda", method="normal", block_size=64, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.num_bits = num_bits
-        self.device = device
-        self.method = method
-        self.block_size = block_size
-        if self.method == "normal":
-            self.norm_lookup_table = self.create_normal_map(num_bits=self.num_bits)
-            self.norm_lookup_table = self.norm_lookup_table.to(device)
-        elif self.method == "uniform":
-            self.norm_lookup_table = self.create_uniform_map(num_bits=self.num_bits)
-            self.norm_lookup_table = self.norm_lookup_table.to(device)
-        else:
-            raise NotImplementedError("Other quantization methods not supported yet.")
+def _get_normal_map(num_bits=2):
+    global _normal_map
+    if num_bits not in _normal_map:
+        _normal_map[num_bits] = create_normal_map(num_bits)
+    return _normal_map[num_bits]
 
-    @staticmethod
-    def create_uniform_map(symmetric=False, num_bits=4):
-        if symmetric:
-            # print("symmetric uniform quantization")
-            negative = torch.linspace(-1, 0, 2 ** (num_bits - 1))
-            positive = torch.linspace(0, 1, 2 ** (num_bits - 1))
-            table = torch.cat([negative, positive[1:]])
-        else:
-            # print("asymmetric uniform quantization")
-            table = torch.linspace(-1, 1, 2**num_bits)
-        return table
+def create_normal_map(num_bits=2, offset=0.9677083):
+    try:
+        from scipy.stats import norm
+    except ImportError:
+        raise ImportError("The required package 'scipy' is not installed. Please install it to continue.")
 
-    @staticmethod
-    def create_normal_map(offset=0.9677083, symmetric=False, num_bits=2):
-        try:
-            from scipy.stats import norm
-        except ImportError:
-            raise ImportError("The required package 'scipy' is not installed. Please install it to continue.")
+    variations = 2**num_bits
+    # one more positive value, this is an asymmetric type
+    v1 = norm.ppf(torch.linspace(offset, 0.5, variations // 2 + 1)[:-1]).tolist()
+    v2 = [0]
+    v3 = (-norm.ppf(torch.linspace(offset, 0.5, variations // 2)[:-1])).tolist()
+    v = v1 + v2 + v3
 
-        variations = 2**num_bits
-        if symmetric:
-            v = norm.ppf(torch.linspace(1 - offset, offset, variations + 1)).tolist()
-            values = []
-            for index in range(len(v) - 1):
-                values.append(0.5 * v[index] + 0.5 * v[index + 1])
-            v = values
-        else:
-            # one more positive value, this is an asymmetric type
-            v1 = norm.ppf(torch.linspace(offset, 0.5, variations // 2 + 1)[:-1]).tolist()
-            v2 = [0]
-            v3 = (-norm.ppf(torch.linspace(offset, 0.5, variations // 2)[:-1])).tolist()
-            v = v1 + v2 + v3
-
-        values = torch.Tensor(v)
-        values = values.sort().values
-        values /= values.max()
-        return values
-
-    def quantize_block(self, weight):
-        if len(weight.shape) != 2:
-            raise ValueError(f"Only support 2D matrix, but your input has {len(weight.shape)} dimensions.")
-        if weight.shape[0] * weight.shape[1] % self.block_size != 0:
-            raise ValueError(
-                f"Weight with shape ({weight.shape[0]} x {weight.shape[1]}) "
-                f"is not dividable by block size {self.block_size}."
-            )
-
-        M, N = weight.shape
-        device = weight.device
-
-        # Quantization
-        weight_flatten = weight.flatten()  # (M*N, )
-        weight_block = weight_flatten.reshape(-1, self.block_size)  # (L, B), L = M * N / B
-        if self.method == "normal":
-            weight_max = weight_block.abs().max(dim=-1)[0]  # (L, 1)
-        elif self.method == "uniform":
-            weight_max = weight_block.mean(dim=-1) + 2.5 * weight_block.std(dim=-1)
-        else:
-            raise NotImplementedError("Method not supported yet.")
-        weight_max = weight_max.unsqueeze(-1)
-        weight_divabs = weight_block / weight_max  # (L, B)
-        weight_divabs = weight_divabs.unsqueeze(-1)  # (L, B, 1)
-        L_reshaped = self.norm_lookup_table.reshape(1, -1)  # (1, 2**K)
-
-        abs_diff = torch.abs(weight_divabs - L_reshaped)  # (L, B, 2**K)
-        qweight = torch.argmin(abs_diff, dim=-1)  # (L, B)
-
-        # Pack multiple k-bit into uint8
-        qweight = qweight.reshape(-1, 8 // self.num_bits)
-        qweight_pack = torch.zeros((M * N // 8 * self.num_bits, 1), dtype=torch.uint8, device=device)
-
-        # data format example:
-        # [1, 0, 3, 2] or [01, 00, 11, 10]  -> [10110001], LIFO
-        for i in range(8 // self.num_bits):
-            qweight[:, i] = qweight[:, i] << i * self.num_bits
-            qweight_pack[:, 0] |= qweight[:, i]
-
-        return qweight_pack, weight_max, weight.shape
-
-    def dequantize_block(self, qweight, weight_max, weight_shape):
-        # unpack weight
-        device = qweight.device
-        weight = torch.zeros((qweight.shape[0], 8 // self.num_bits), dtype=torch.float32, device=device)
-        for i in range(8 // self.num_bits):
-            lookup_table_idx = qweight.to(torch.long) % 2**self.num_bits  # get the most right 2 bits
-            lookup_table_idx = lookup_table_idx.to(torch.long)
-            weight[:, i] = self.norm_lookup_table[lookup_table_idx].squeeze()
-            qweight = qweight >> self.num_bits  # right shift 2 bits of the original data
-
-        weight_block = weight.reshape(-1, self.block_size)
-        weight = weight_block * weight_max
-        weight = weight.reshape(weight_shape)
-
-        return weight
-
-    def get_qweight_with_AB(self, weight, B, A):
-        scale = B @ A
-        scale = torch.clamp(scale, min=1e-8)
-        assert weight.shape == scale.shape, f"Weight and scale shapes do not match: {weight.shape} != {scale.shape}"
-        
-        weight_divabs = weight / scale  # (L, B)
-        weight_divabs = weight_divabs.unsqueeze(-1)  # (L, B, 1)
-        L_reshaped = self.norm_lookup_table.reshape(1, -1)  # (1, 2**K)
-
-        abs_diff = torch.abs(weight_divabs - L_reshaped)  # (L, B, 2**K)
-        qweight_idx = torch.argmin(abs_diff, dim=-1)  # (L, B)
-        qweight = self.norm_lookup_table[qweight_idx]  # (L, B)
-
-        return qweight
-
-def refine_AB(W, B, A, quantizer, steps=3000, lr=1e-3):
-    """
-    W ~ (B @ A) * Q
-    """
-    B = B.clone().detach().requires_grad_(True)
-    A = A.clone().detach().requires_grad_(True)    
-    
-    optimizer = torch.optim.Adam([B, A], lr=lr)
-    
-    for step in range(steps):
-        with torch.no_grad():
-            Q = quantizer.get_qweight_with_AB(W, B, A)
-        
-        optimizer.zero_grad()
-        Scale = B @ A
-        W_hat = Scale * Q
-        loss = torch.mean((W_hat - W) ** 2)
-        loss.backward()
-        optimizer.step()
-
-        if step % 100 == 0:
-            print(f"Step {step} loss: {loss.item()}")
-    
-    return Q, B, A
+    values = torch.Tensor(v)
+    values = values.sort().values
+    values /= values.max()
+    return values
 
 def _low_rank_decomposition(weight, reduced_rank=32):
     """
@@ -197,7 +71,74 @@ def _low_rank_decomposition(weight, reduced_rank=32):
     Vh = Vh[: reduced_rank, :]
     S = S[: reduced_rank]
 
-    return {"U": U, "S": S, "Vh": Vh, "reduced_rank": reduced_rank}
+    B = U @ torch.sqrt(torch.diag(S))
+    A = torch.sqrt(torch.diag(S)) @ Vh
+
+    return B, A
+
+def pissaquant_init_from_absmax(weight, rank):
+    block_size = weight.shape[1] // rank
+    while weight.shape[1] % block_size:
+        block_size -= 1
+    assert block_size > 0, f"block_size must be greater than 0, got {block_size}"
+
+    weight_blocks = weight.view(weight.shape[0], -1, block_size)
+    absmax = weight_blocks.abs().max(dim=-1)[0]
+    absmax_expanded = absmax.repeat_interleave(block_size, dim=-1)
+    absmax_expanded = absmax_expanded.reshape((weight.shape[0], weight.shape[1]))
+
+    return _low_rank_decomposition(absmax_expanded, rank)
+
+def get_qweight_with_AB(weight, B, A, norm_lookup_table):
+    scale = B @ A
+    scale = torch.clamp(scale, min=1e-8)
+    assert weight.shape == scale.shape, f"Weight and scale shapes do not match: {weight.shape} != {scale.shape}"
+    
+    weight_divabs = weight / scale  # (L, B)
+    weight_divabs = weight_divabs.unsqueeze(-1)  # (L, B, 1)
+    L_reshaped = norm_lookup_table.reshape(1, -1)  # (1, 2**K)
+
+    abs_diff = torch.abs(weight_divabs - L_reshaped)  # (L, B, 2**K)
+    qweight_idx = torch.argmin(abs_diff, dim=-1)  # (L, B)
+    qweight = norm_lookup_table[qweight_idx]  # (L, B)
+
+    return qweight
+
+def refine_ab(
+    w_fp32: torch.Tensor,
+    B: torch.Tensor,
+    A: torch.Tensor,
+    bits: int,
+    eps: float = 1e-8, 
+    steps: int = 3000,
+    lr: float = 1e-3,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Iteratively refine A/B to reduce quantization error.
+    """
+    device = w_fp32.device
+    B = B.to(device=device, dtype=torch.float32).detach().requires_grad_(True)
+    A = A.to(device=device, dtype=torch.float32).detach().requires_grad_(True)
+    optimizer = torch.optim.Adam([B, A], lr=lr)
+
+    norm_lookup_table = _get_normal_map(bits).to(device)
+
+    for step in range(steps):
+        with torch.no_grad():
+            qweight = get_qweight_with_AB(w_fp32, B, A, norm_lookup_table)
+
+        optimizer.zero_grad(set_to_none=True)
+        scale = torch.clamp(B @ A, min=eps)
+        w_hat = qweight * scale
+        loss = torch.linalg.norm(w_hat - w_fp32)
+        loss.backward()
+        optimizer.step()
+
+        if step % 100 == 0:
+            logging.info(f"Refine AB: Step {step} loss: {loss.item()}")
+
+    return B.detach(), A.detach(), qweight
+
 
 
 def pissaquant_init(weight: Union[torch.Tensor, torch.nn.Parameter], num_bits: int, reduced_rank: int, apply_quantization: bool):
@@ -213,34 +154,15 @@ def pissaquant_init(weight: Union[torch.Tensor, torch.nn.Parameter], num_bits: i
         f"Weight: ({out_feature}, {in_feature}) | Rank: {reduced_rank} | Num Bits: {num_bits}"
     )
 
-    block_size = in_feature // reduced_rank
-    while in_feature % block_size:
-        block_size -= 1
-    assert block_size > 0
+    w_fp32 = weight.to(dtype=torch.float32)
+    
+    B, A = pissaquant_init_from_absmax(w_fp32, reduced_rank)
 
-    quantizer = NFQuantizer(num_bits=num_bits, device=device, method="normal", block_size=block_size)
-
-    weight = weight.to(device=device, dtype=torch.float32)
-
-    torch.cuda.empty_cache()
-    # Quantization
-    _, max_abs, _ = quantizer.quantize_block(weight)
-
-    absmax_expanded = max_abs.expand(-1, block_size)
-    absmax_expanded = absmax_expanded.reshape((out_feature, in_feature))
-
-    # Decompose the residual by SVD
-    output = _low_rank_decomposition(absmax_expanded, reduced_rank=reduced_rank)
-    U, S, Vh = output["U"], output["S"], output["Vh"]
-
-    lora_B = U @ torch.sqrt(torch.diag(S))
-    lora_A = torch.sqrt(torch.diag(S)) @ Vh
-
-    Q, lora_B, lora_A = refine_AB(weight, lora_B, lora_A, quantizer)
+    B, A, qweight = refine_ab(w_fp32, B, A, num_bits)
 
     if not apply_quantization:
-        new_weight = weight / (lora_B @ lora_A)
+        new_weight = weight / (B @ A)
     else:
-        new_weight = Q
+        new_weight = qweight
 
-    return new_weight.to(device=device, dtype=dtype), lora_A, lora_B
+    return new_weight.to(device=device, dtype=dtype), B, A
