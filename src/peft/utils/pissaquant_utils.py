@@ -85,32 +85,6 @@ class NFQuantizer:
         values /= values.max()
         return values
 
-    def quantize_tensor(self, weight):
-        max_abs = torch.abs(weight).max()
-        weight_normed = weight / max_abs
-
-        weight_normed_expanded = weight_normed.unsqueeze(-1)
-
-        # Reshape L to have the same number of dimensions as X_expanded
-        L_reshaped = torch.tensor(self.norm_lookup_table).reshape(1, -1)
-
-        # Calculate the absolute difference between X_expanded and L_reshaped
-        abs_diff = torch.abs(weight_normed_expanded - L_reshaped)
-
-        # Find the index of the minimum absolute difference for each element
-        qweight = torch.argmin(abs_diff, dim=-1)
-        return qweight, max_abs
-
-    def dequantize_tensor(self, qweight, max_abs):
-        qweight_flatten = qweight.flatten()
-
-        weight_normed = self.norm_lookup_table[qweight_flatten]
-        weight = weight_normed * max_abs
-
-        weight = weight.reshape(qweight.shape)
-
-        return weight
-
     def quantize_block(self, weight):
         if len(weight.shape) != 2:
             raise ValueError(f"Only support 2D matrix, but your input has {len(weight.shape)} dimensions.")
@@ -168,6 +142,45 @@ class NFQuantizer:
 
         return weight
 
+    def get_qweight_with_AB(self, weight, B, A):
+        scale = B @ A
+        scale = torch.clamp(scale, min=1e-8)
+        assert weight.shape == scale.shape, f"Weight and scale shapes do not match: {weight.shape} != {scale.shape}"
+        
+        weight_divabs = weight / scale  # (L, B)
+        weight_divabs = weight_divabs.unsqueeze(-1)  # (L, B, 1)
+        L_reshaped = self.norm_lookup_table.reshape(1, -1)  # (1, 2**K)
+
+        abs_diff = torch.abs(weight_divabs - L_reshaped)  # (L, B, 2**K)
+        qweight_idx = torch.argmin(abs_diff, dim=-1)  # (L, B)
+        qweight = self.norm_lookup_table[qweight_idx]  # (L, B)
+
+        return qweight
+
+def refine_AB(W, B, A, quantizer, steps=2000, lr=1e-3):
+    """
+    W ~ (B @ A) * Q
+    """
+    B = B.requires_grad_(True)
+    A = A.requires_grad_(True)    
+    
+    optimizer = torch.optim.Adam([B, A], lr=lr)
+    
+    for step in range(steps):
+        with torch.no_grad():
+            Q = quantizer.get_qweight_with_AB(W, B, A)
+        
+        optimizer.zero_grad()
+        Scale = B @ A
+        W_hat = Scale * Q
+        loss = torch.mean((W_hat - W) ** 2)
+        loss.backward()
+        optimizer.step()
+
+        if step % 100 == 0:
+            print(f"Step {step} loss: {loss.item()}")
+    
+    return Q, B, A
 
 def _low_rank_decomposition(weight, reduced_rank=32):
     """
@@ -187,12 +200,7 @@ def _low_rank_decomposition(weight, reduced_rank=32):
     return {"U": U, "S": S, "Vh": Vh, "reduced_rank": reduced_rank}
 
 
-@torch.no_grad()
 def pissaquant_init(weight: Union[torch.Tensor, torch.nn.Parameter], num_bits: int, reduced_rank: int, apply_quantization: bool):
-    # if is_bnb_available():
-    #     import bitsandbytes as bnb
-    # else:
-    #     raise ValueError("bitsandbytes is not available, please install it to use PiSSAQuant.")
 
     if num_bits not in [2, 4, 8]:
         raise ValueError("Only support 2, 4, 8 bits quantization")
@@ -211,15 +219,12 @@ def pissaquant_init(weight: Union[torch.Tensor, torch.nn.Parameter], num_bits: i
     assert block_size > 0
 
     quantizer = NFQuantizer(num_bits=num_bits, device=device, method="normal", block_size=block_size)
-    compute_device = device
 
-    weight = weight.to(device=compute_device, dtype=torch.float32)    
+    weight = weight.to(device=device, dtype=torch.float32)
 
     torch.cuda.empty_cache()
     # Quantization
-    quantized_weight, max_abs, shape = quantizer.quantize_block(weight)
-
-    # new_weight = quantizer.dequantize_block(quantized_weight, torch.ones_like(max_abs, device=max_abs.device, dtype=max_abs.dtype), shape)
+    _, max_abs, _ = quantizer.quantize_block(weight)
 
     absmax_expanded = max_abs.expand(-1, block_size)
     absmax_expanded = absmax_expanded.reshape((out_feature, in_feature))
@@ -230,9 +235,12 @@ def pissaquant_init(weight: Union[torch.Tensor, torch.nn.Parameter], num_bits: i
 
     lora_B = U @ torch.sqrt(torch.diag(S))
     lora_A = torch.sqrt(torch.diag(S)) @ Vh
-    if apply_quantization:
-        new_weight = quantizer.dequantize_block(quantized_weight, torch.ones_like(max_abs, device=max_abs.device, dtype=max_abs.dtype), shape)
+
+    Q, lora_B, lora_A = refine_AB(weight, lora_B, lora_A, quantizer)
+
+    if not apply_quantization:
+        new_weight = weight / (lora_B @ lora_A)
     else:
-        new_weight = weight / (lora_B @ lora_A.T)
+        new_weight = Q
 
     return new_weight.to(device=device, dtype=dtype), lora_A, lora_B
