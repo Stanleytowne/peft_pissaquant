@@ -594,7 +594,6 @@ class Linear(nn.Module, LoraLayer):
             return
         
         if self.kwargs.get('pissaquant_bits', None):
-            print("mergin pissaquant module")
             assert len(self.active_adapters) == 1, "only support one pissaquant adapter at a time"
             base_layer = self.get_base_layer()
             active_adapter = self.active_adapters[0]
